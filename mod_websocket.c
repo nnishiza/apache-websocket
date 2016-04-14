@@ -282,8 +282,22 @@ static const char *mod_websocket_conf_max_message_size(cmd_parms *cmd,
     if ((conf != NULL) && (size != NULL)) {
         apr_int64_t message_limit = apr_atoi64(size);
         if (message_limit > 0) {
-            conf->message_limit = message_limit;
-            response = NULL;
+            if (message_limit > APR_SIZE_MAX) {
+                /*
+                 * Since we pass messages as a single contiguous buffer to the
+                 * plugin, they can't exceed the max size_t.
+                 *
+                 * FIXME: a streaming API could allow plugins to get around this
+                 * restriction.
+                 */
+                response = apr_psprintf(cmd->pool,
+                                        "Max message size is too large for your"
+                                        " system (reduce to %"APR_SIZE_T_FMT")",
+                                        APR_SIZE_MAX);
+            } else {
+                conf->message_limit = message_limit;
+                response = NULL;
+            }
         }
         else {
             response = "Invalid maximum message size";
