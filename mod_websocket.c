@@ -40,6 +40,7 @@
 #include "http_config.h"
 #include "http_log.h"
 #include "http_protocol.h"
+#include "util_varbuf.h"
 
 #include "websocket_plugin.h"
 #include "validate_utf8.h"
@@ -833,8 +834,7 @@ static const char *make_supported_version_header(apr_pool_t *pool)
 
 typedef struct _WebSocketFrameData
 {
-    apr_uint64_t application_data_offset;
-    unsigned char *application_data;
+    struct ap_varbuf message_buf;
     unsigned char fin;
     unsigned char opcode;
     unsigned int utf8_state;
@@ -1181,16 +1181,9 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
         /* Deal with extension data when we support them -- FIXME */
         if (state->extension_bytes_remaining == 0) {
             if (state->payload_length > 0) {
-                state->frame->application_data = (unsigned char *)
-                    realloc(state->frame->application_data,
-                            state->frame->application_data_offset +
-                            state->payload_length);
-                if (state->frame->application_data == NULL) {
-                    state->status_code = (server->state->protocol_version >= 13) ?
-                                          STATUS_CODE_INTERNAL_ERROR :
-                                          STATUS_CODE_GOING_AWAY;
-                    return 0;
-                }
+                ap_varbuf_grow(&state->frame->message_buf,
+                               state->frame->message_buf.strlen +
+                                   state->payload_length);
             }
             state->framing_state = DATA_FRAMING_APPLICATION_DATA;
         }
@@ -1200,9 +1193,9 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
     {
         apr_int64_t block_data_length;
         apr_int64_t block_length = 0;
-        apr_uint64_t application_data_offset =
-            state->frame->application_data_offset;
-        unsigned char *application_data = state->frame->application_data;
+        apr_size_t message_len = state->frame->message_buf.strlen;
+        unsigned char *message_data =
+            (unsigned char*) state->frame->message_buf.buf;
 
         block_length = block_size - block_offset;
         block_data_length = (state->payload_length > block_length) ?
@@ -1231,21 +1224,21 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 for (i = 0; i < block_data_length; i++) {
                     c = block[block_offset++] ^
                         state->mask[state->mask_offset++ & 3];
-                    if (application_data_offset >= skip_bytes) {
+                    if (message_len >= skip_bytes) {
                         utf8_state = validate_utf8[utf8_state + c];
                         if (utf8_state == UTF8_INVALID) {
                             state->payload_length = block_data_length;
                             break;
                         }
                     }
-                    application_data[application_data_offset++] = c;
+                    message_data[message_len++] = c;
                 }
                 state->frame->utf8_state = utf8_state;
             }
             else {
                 /* Need to optimize the unmasking -- FIXME */
                 for (i = 0; i < block_data_length; i++) {
-                    application_data[application_data_offset++] =
+                    message_data[message_len++] =
                         block[block_offset++] ^
                         state->mask[state->mask_offset++ & 3];
                 }
@@ -1256,8 +1249,8 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
             int validate = 0; /* whether we need to validate UTF-8 */
             apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
 
-            memcpy(&application_data[application_data_offset],
-                   &block[block_offset], block_data_length);
+            memcpy(&message_data[message_len], &block[block_offset],
+                   block_data_length);
 
             if (state->opcode == OPCODE_TEXT) {
                 validate = 1;
@@ -1272,14 +1265,12 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
 
             if (validate) {
                 apr_int64_t i;
-                apr_int64_t application_data_end = application_data_offset
-                                                   + block_data_length;
+                apr_int64_t message_data_end = message_len + block_data_length;
                 unsigned int utf8_state = state->frame->utf8_state;
 
-                for (i = application_data_offset; i < application_data_end; i++) {
+                for (i = message_len; i < message_data_end; i++) {
                     if (i >= skip_bytes) {
-                        utf8_state = validate_utf8[utf8_state +
-                                                   application_data[i]];
+                        utf8_state = validate_utf8[utf8_state + message_data[i]];
                         if (utf8_state == UTF8_INVALID) {
                             state->payload_length = block_data_length;
                             break;
@@ -1288,7 +1279,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 }
                 state->frame->utf8_state = utf8_state;
             }
-            application_data_offset += block_data_length;
+            message_len += block_data_length;
             block_offset += block_data_length;
         }
         state->payload_length -= block_data_length;
@@ -1312,8 +1303,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 break;
 
             case OPCODE_CLOSE:
-                if (!is_valid_status_code(application_data,
-                                          application_data_offset,
+                if (!is_valid_status_code(message_data, message_len,
                                           !conf->allow_reserved)) {
                     state->status_code = STATUS_CODE_PROTOCOL_ERROR;
                 } else if (state->frame->utf8_state != UTF8_VALID) {
@@ -1326,8 +1316,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
             case OPCODE_PING:
                 apr_thread_mutex_lock(server->state->mutex);
                 mod_websocket_send_internal(server->state, MESSAGE_TYPE_PONG,
-                                            application_data,
-                                            application_data_offset);
+                                            message_data, message_len);
                 apr_thread_mutex_unlock(server->state->mutex);
                 break;
 
@@ -1341,23 +1330,23 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
 
             if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
                 conf->plugin->on_message(plugin_private, server, message_type,
-                                         application_data,
-                                         application_data_offset);
+                                         message_data, message_len);
             }
 
             /* Get ready for the next frame. */
             state->framing_state = DATA_FRAMING_START;
 
             if (state->fin) {
-                if (state->frame->application_data != NULL) {
-                    free(state->frame->application_data);
-                    state->frame->application_data = NULL;
-                }
+                apr_pool_t *pool = state->frame->message_buf.pool;
+
+                ap_varbuf_free(&state->frame->message_buf);
+                ap_varbuf_init(pool, &state->frame->message_buf, 0);
+
                 state->frame->message_length = 0;
-                application_data_offset = 0;
+                message_len = 0;
             }
         }
-        state->frame->application_data_offset = application_data_offset;
+        state->frame->message_buf.strlen = message_len;
         break;
     }
 
@@ -1479,12 +1468,19 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
 
         read_state.framing_state = DATA_FRAMING_START;
         read_state.status_code = STATUS_CODE_OK;
+
+        ap_varbuf_init(r->pool, &read_state.control_frame.message_buf, 0);
+        read_state.control_frame.message_buf.strlen = 0;
         read_state.control_frame.fin = 1;
         read_state.control_frame.opcode = 8;
         read_state.control_frame.utf8_state = UTF8_VALID;
+
+        ap_varbuf_init(r->pool, &read_state.message_frame.message_buf, 0);
+        read_state.message_frame.message_buf.strlen = 0;
         read_state.message_frame.fin = 1;
         read_state.message_frame.opcode = 0;
         read_state.message_frame.utf8_state = UTF8_VALID;
+
         read_state.frame = &read_state.control_frame;
         read_state.opcode = 0xFF;
 
@@ -1581,12 +1577,9 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
                 break;
             }
         }
-        if (read_state.message_frame.application_data != NULL) {
-            free(read_state.message_frame.application_data);
-        }
-        if (read_state.control_frame.application_data != NULL) {
-            free(read_state.control_frame.application_data);
-        }
+
+        ap_varbuf_free(&read_state.message_frame.message_buf);
+        ap_varbuf_free(&read_state.control_frame.message_buf);
 
         /* Send server-side closing handshake */
         status_code_buffer[0] = (read_state.status_code >> 8) & 0xFF;
