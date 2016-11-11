@@ -279,6 +279,14 @@ static const char *mod_websocket_conf_max_message_size(cmd_parms *cmd,
     websocket_config_rec *conf = (websocket_config_rec *)confv;
     char *response;
 
+    /* Warn about the name change from MaxMessageSize, if appropriate. */
+    if (cmd->cmd->name[0] == 'M') {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, APR_SUCCESS, cmd->server,
+                     "The MaxMessageSize directive (%s:%d) is deprecated; use "
+                     "WebSocketMaxMessageSize instead",
+                     cmd->directive->filename, cmd->directive->line_num);
+    }
+
     if ((conf != NULL) && (size != NULL)) {
         apr_int64_t message_limit = apr_atoi64(size);
         if (message_limit > 0) {
@@ -1822,9 +1830,13 @@ static const command_rec websocket_cmds[] = {
     AP_INIT_ITERATE("WebSocketTrustedOrigin", mod_websocket_conf_add_origin,
                     NULL, OR_AUTHCFG,
                     "Specifies one or more trusted Origins that are accepted during the opening handshake"),
-    AP_INIT_TAKE1("MaxMessageSize", mod_websocket_conf_max_message_size, NULL,
-                  OR_AUTHCFG,
+    AP_INIT_TAKE1("WebSocketMaxMessageSize",
+                  mod_websocket_conf_max_message_size, NULL, OR_AUTHCFG,
                   "Maximum size (in bytes) of a message to accept; default is 33554432 bytes (32 MB)"),
+
+    /* Obsolete alias for WebSocketMaxMessageSize. */
+    AP_INIT_TAKE1("MaxMessageSize", mod_websocket_conf_max_message_size, NULL,
+                  OR_AUTHCFG, "Obsolete; use WebSocketMaxMessageSize instead"),
     {NULL}
 };
 

@@ -207,29 +207,33 @@ is using the `__stdcall` calling convention:
       </Location>
     </IfModule>
 
-### `MaxMessageSize`
+### `WebSocketMaxMessageSize`
+
+_Note: in releases 0.1.1 and earlier, this directive was called
+`MaxMessageSize`. It was renamed to properly namespace it with the other
+directives._
 
 Since we are dealing with messages, not streams, we need to specify a maximum
 message size. The default size is 32 megabytes. You may override this value by
-specifying a `MaxMessageSize` configuration setting. Here is an example of how
-to set the maximum message size is set to 64 megabytes:
+specifying a `WebSocketMaxMessageSize` configuration setting. Here is an example
+of how to set the maximum message size is set to 64 megabytes:
 
     <IfModule mod_websocket.c>
       <Location /echo>
         SetHandler websocket-handler
         WebSocketHandler /usr/lib/apache2/modules/mod_websocket_echo.so echo_init
-        MaxMessageSize 67108864
+        WebSocketMaxMessageSize 67108864
       </Location>
     </IfModule>
 
-If you are using extremely small values for `MaxMessageSize`, be aware that its
-limit also applies to control frame payloads. As an example, with a
-`MaxMessageSize` of 30, the maximum length of a close reason message accepted by
-a server will be 28 bytes (2 bytes for the close code plus 28 for the message
-reaches the limit of 30). Any larger payloads will result in a closed
-connection. It's recommended that you go no lower than 125 (the maximum size of
-a WebSocket control frame payload) to avoid closing the connection on correctly
-implemented clients.
+If you are using extremely small values for `WebSocketMaxMessageSize`, be aware
+that its limit also applies to control frame payloads. As an example, with a
+`WebSocketMaxMessageSize` of 30, the maximum length of a close reason message
+accepted by a server will be 28 bytes (2 bytes for the close code plus 28 for
+the message reaches the limit of 30). Any larger payloads will result in a
+closed connection. It's recommended that you go no lower than 125 (the maximum
+size of a WebSocket control frame payload) to avoid closing the connection on
+correctly implemented clients.
 
 ### `WebSocketOriginCheck`
 

@@ -71,5 +71,5 @@ DocumentRoot htdocs
   SetHandler websocket-handler
   WebSocketHandler modules/mod_websocket_echo.so echo_init
 
-  MaxMessageSize 4
+  WebSocketMaxMessageSize 4
 </Location>
