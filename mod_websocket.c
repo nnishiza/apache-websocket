@@ -189,32 +189,48 @@ static const char *mod_websocket_conf_handler(cmd_parms *cmd, void *confv,
     apr_dso_handle_t *res_handle = NULL;
     apr_dso_handle_sym_t sym;
     WebSocketPlugin *plugin;
+    const char *errmsg = NULL;
 
     if (!conf || !path || !name) {
-        return "Invalid parameters";
+        return "Invalid parameters for WebSocketHandler";
     }
 
     if (apr_dso_load(&res_handle, ap_server_root_relative(cmd->pool, path),
                      cmd->pool) != APR_SUCCESS) {
         char err[256];
-        return apr_pstrcat(cmd->pool, "Could not load WebSocket plugin ", path,
+        return apr_pstrcat(cmd->pool, "Could not load WebSocketHandler ", path,
                            ": ", apr_dso_error(res_handle, err, sizeof(err)),
                            NULL);
     }
 
     if ((apr_dso_sym(&sym, res_handle, name) != APR_SUCCESS) || !sym) {
         apr_dso_unload(res_handle);
-        return "Could not find initialization function in module";
+        return apr_psprintf(cmd->pool, "Could not find initialization function "
+                            "\"%s\" for WebSocketHandler %s", name, path);
     }
 
+    /* Get the plugin struct from the module and sanity-check. */
     plugin = ((WS_Init) sym) ();
 
-    if (!plugin ||
-        (plugin->version != WEBSOCKET_PLUGIN_VERSION_0) ||
-        (plugin->size < sizeof(WebSocketPlugin)) ||
-        !plugin->on_message) { /* Require an on_message handler */
+    if (!plugin) {
+        errmsg = "returned NULL";
+    }
+    else if (plugin->version != WEBSOCKET_PLUGIN_VERSION_0) {
+        errmsg = apr_psprintf(cmd->pool, "unsupported plugin version %u",
+                              plugin->version);
+    }
+    else if (plugin->size < sizeof(WebSocketPlugin)) {
+        errmsg = "invalid plugin size; check plugin version and compiler";
+    }
+    else if (!plugin->on_message) {
+        errmsg = "on_message handler is NULL";
+    }
+
+    if (errmsg) {
         apr_dso_unload(res_handle);
-        return "Invalid response from initialization function";
+        return apr_pstrcat(cmd->pool, "Invalid response from WebSocketHandler "
+                           "initialization function ", name, " (", errmsg, ")",
+                           NULL);
     }
 
     conf->res_handle = res_handle;
