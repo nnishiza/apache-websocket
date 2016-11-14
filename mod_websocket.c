@@ -186,52 +186,43 @@ static const char *mod_websocket_conf_handler(cmd_parms *cmd, void *confv,
                                               const char *name)
 {
     websocket_config_rec *conf = (websocket_config_rec *)confv;
-    char *response;
+    apr_dso_handle_t *res_handle = NULL;
+    apr_dso_handle_sym_t sym;
+    WebSocketPlugin *plugin;
 
-    if ((conf != NULL) && (path != NULL) && (name != NULL)) {
-        apr_dso_handle_t *res_handle = NULL;
-        apr_dso_handle_sym_t sym;
+    if (!conf || !path || !name) {
+        return "Invalid parameters";
+    }
 
-        if (apr_dso_load
-            (&res_handle, ap_server_root_relative(cmd->pool, path),
-             cmd->pool) == APR_SUCCESS) {
-            if ((apr_dso_sym(&sym, res_handle, name) == APR_SUCCESS) &&
-                (sym != NULL)) {
-                WebSocketPlugin *plugin = ((WS_Init) sym) ();
-                if ((plugin != NULL) &&
-                    (plugin->version == WEBSOCKET_PLUGIN_VERSION_0) &&
-                    (plugin->size >= sizeof(WebSocketPlugin)) &&
-                    (plugin->on_message != NULL)) { /* Require an on_message handler */
-                    conf->res_handle = res_handle;
-                    conf->plugin = plugin;
-                    apr_pool_cleanup_register(cmd->pool, conf,
-                                              mod_websocket_cleanup_config,
-                                              apr_pool_cleanup_null);
-                    response = NULL;
-                }
-                else {
-                    apr_dso_unload(res_handle);
-                    response = "Invalid response from initialization function";
-                }
-            }
-            else {
-                apr_dso_unload(res_handle);
-                response = "Could not find initialization function in module";
-            }
-        }
-        else {
-            char err[256];
-            response = apr_pstrcat(cmd->pool,
-                                   "Could not load WebSocket plugin ", path,
-                                   ": ",
-                                   apr_dso_error(res_handle, err, sizeof(err)),
-                                   NULL);
-        }
+    if (apr_dso_load(&res_handle, ap_server_root_relative(cmd->pool, path),
+                     cmd->pool) != APR_SUCCESS) {
+        char err[256];
+        return apr_pstrcat(cmd->pool, "Could not load WebSocket plugin ", path,
+                           ": ", apr_dso_error(res_handle, err, sizeof(err)),
+                           NULL);
     }
-    else {
-        response = "Invalid parameters";
+
+    if ((apr_dso_sym(&sym, res_handle, name) != APR_SUCCESS) || !sym) {
+        apr_dso_unload(res_handle);
+        return "Could not find initialization function in module";
     }
-    return response;
+
+    plugin = ((WS_Init) sym) ();
+
+    if (!plugin ||
+        (plugin->version != WEBSOCKET_PLUGIN_VERSION_0) ||
+        (plugin->size < sizeof(WebSocketPlugin)) ||
+        !plugin->on_message) { /* Require an on_message handler */
+        apr_dso_unload(res_handle);
+        return "Invalid response from initialization function";
+    }
+
+    conf->res_handle = res_handle;
+    conf->plugin = plugin;
+    apr_pool_cleanup_register(cmd->pool, conf, mod_websocket_cleanup_config,
+                              apr_pool_cleanup_null);
+
+    return NULL;
 }
 
 static const char *mod_websocket_conf_origin_check(cmd_parms *cmd, void *confv,
