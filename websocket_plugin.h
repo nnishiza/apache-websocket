@@ -93,7 +93,8 @@ extern "C"
     struct _WebSocketPlugin;
 
     typedef struct _WebSocketPlugin *(CALLBACK * WS_Init)
-                                     ();
+                                     (void);
+
     typedef void (CALLBACK * WS_Destroy)
                  (struct _WebSocketPlugin *plugin);
 
