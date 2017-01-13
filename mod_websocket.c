@@ -91,7 +91,6 @@ typedef struct
 #define DATA_FRAMING_PAYLOAD_LENGTH_EXT 3
 #define DATA_FRAMING_EXTENSION_DATA     4
 #define DATA_FRAMING_APPLICATION_DATA   5
-#define DATA_FRAMING_CLOSE              6
 
 #define FRAME_GET_FIN(BYTE)         (((BYTE) >> 7) & 0x01)
 #define FRAME_GET_RSV1(BYTE)        (((BYTE) >> 6) & 0x01)
@@ -832,6 +831,7 @@ typedef struct _WebSocketFrameData
 typedef struct
 {
     int framing_state;
+    int closing; /* should the connection be closed due to incoming data? */
     unsigned short status_code;
     /* XXX fin and opcode appear to be duplicated with frame; can they be removed? */
     unsigned char fin;
@@ -1019,7 +1019,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
 {
     apr_size_t block_offset = 0;
 
-    if (!block_size || (state->framing_state == DATA_FRAMING_CLOSE)) {
+    if (!block_size || state->closing) {
         /* handled_incoming() shouldn't be calling us in this case */
         ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, server->state->r,
                       "mod_websocket_handle_frame called %s",
@@ -1384,7 +1384,7 @@ static void mod_websocket_handle_incoming(const WebSocketServer *server,
 
         if (!handled_bytes) {
             /* Close the connection. */
-            state->framing_state = DATA_FRAMING_CLOSE;
+            state->closing = 1;
             return;
         }
 
@@ -1493,7 +1493,7 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
          * the client and data coming from the server. Only block in poll() if
          * there is no work to be done for either side.
          */
-        while ((read_state.framing_state != DATA_FRAMING_CLOSE)) {
+        while (!read_state.closing) {
             apr_status_t rv;
             apr_interval_time_t timeout;
             WebSocketMessageData *msg;
