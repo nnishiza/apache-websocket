@@ -91,7 +91,6 @@ typedef struct
 #define DATA_FRAMING_PAYLOAD_LENGTH_EXT 3
 #define DATA_FRAMING_EXTENSION_DATA     4
 #define DATA_FRAMING_APPLICATION_DATA   5
-#define DATA_FRAMING_CLOSE              6
 
 #define FRAME_GET_FIN(BYTE)         (((BYTE) >> 7) & 0x01)
 #define FRAME_GET_RSV1(BYTE)        (((BYTE) >> 6) & 0x01)
@@ -832,6 +831,7 @@ typedef struct _WebSocketFrameData
 typedef struct
 {
     int framing_state;
+    int closing; /* should the connection be closed due to incoming data? */
     unsigned short status_code;
     /* XXX fin and opcode appear to be duplicated with frame; can they be removed? */
     unsigned char fin;
@@ -1001,6 +1001,375 @@ static int is_trusted_origin(request_rec *r, websocket_config_rec *conf,
     return 0;
 }
 
+/**
+ * Reads from the given data block until the end of the block or a frame
+ * boundary is encountered, handling plugin callbacks as messages are received.
+ *
+ * Returns the number of bytes parsed from the block. (At least one byte is
+ * guaranteed to be handled per call, so the block must not be empty.) A return
+ * value of zero indicates that the rest of the block is to be discarded and the
+ * connection closed; state->status_code will be set accordingly.
+ */
+static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
+                                             unsigned char *block,
+                                             apr_size_t block_size,
+                                             WebSocketReadState *state,
+                                             websocket_config_rec *conf,
+                                             void *plugin_private)
+{
+    apr_size_t block_offset = 0;
+
+    if (!block_size || state->closing) {
+        /* handled_incoming() shouldn't be calling us in this case */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, server->state->r,
+                      "mod_websocket_handle_frame called %s",
+                      (block_size ? "after close" : "with empty block"));
+
+        state->status_code = STATUS_CODE_INTERNAL_ERROR;
+        return 0;
+    }
+
+    switch (state->framing_state) {
+    case DATA_FRAMING_START:
+        /*
+         * Since we don't currently support any extensions,
+         * the reserve bits must be 0
+         */
+        if ((FRAME_GET_RSV1(block[block_offset]) != 0) ||
+            (FRAME_GET_RSV2(block[block_offset]) != 0) ||
+            (FRAME_GET_RSV3(block[block_offset]) != 0)) {
+            state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+            return 0;
+        }
+        state->fin = FRAME_GET_FIN(block[block_offset]);
+        state->opcode = FRAME_GET_OPCODE(block[block_offset++]);
+
+        state->framing_state = DATA_FRAMING_PAYLOAD_LENGTH;
+
+        if (state->opcode >= 0x8) { /* Control frame */
+            if (state->fin) {
+                state->frame = &state->control_frame;
+                state->frame->opcode = state->opcode;
+                state->frame->utf8_state = UTF8_VALID;
+            }
+            else {
+                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                return 0;
+            }
+        }
+        else { /* Message frame */
+            state->frame = &state->message_frame;
+            if (state->opcode) {
+                if (state->frame->fin) {
+                    state->frame->opcode = state->opcode;
+                    state->frame->utf8_state = UTF8_VALID;
+                }
+                else {
+                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                    return 0;
+                }
+            }
+            else if (state->frame->fin ||
+                     ((state->opcode = state->frame->opcode) == 0)) {
+                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                return 0;
+            }
+            state->frame->fin = state->fin;
+        }
+        state->payload_length = 0;
+        state->payload_length_bytes_remaining = 0;
+
+        if (block_offset >= block_size) {
+            break; /* Only break if we need more data */
+        }
+
+    case DATA_FRAMING_PAYLOAD_LENGTH:
+        state->payload_length = (apr_int64_t)
+            FRAME_GET_PAYLOAD_LEN(block[block_offset]);
+        state->masking = FRAME_GET_MASK(block[block_offset++]);
+
+        if (state->payload_length == 126) {
+            state->payload_length = 0;
+            state->payload_length_bytes_remaining = 2;
+        }
+        else if (state->payload_length == 127) {
+            state->payload_length = 0;
+            state->payload_length_bytes_remaining = 8;
+        }
+        else {
+            state->payload_length_bytes_remaining = 0;
+        }
+        if ((state->masking == 0) ||   /* Client-side mask is required */
+            ((state->opcode >= 0x8) && /* Control opcodes cannot have a payload larger than 125 bytes */
+             (state->payload_length_bytes_remaining != 0)) ||
+            ((state->opcode == OPCODE_CLOSE) && /* Close payloads must be at least two bytes if not empty */
+             (state->payload_length == 1))) {
+            state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+            return 0;
+        }
+        else {
+            state->framing_state = DATA_FRAMING_PAYLOAD_LENGTH_EXT;
+        }
+        if (block_offset >= block_size) {
+            break;  /* Only break if we need more data */
+        }
+
+    case DATA_FRAMING_PAYLOAD_LENGTH_EXT:
+        while ((state->payload_length_bytes_remaining > 0) &&
+               (block_offset < block_size)) {
+            state->payload_length *= 256;
+            state->payload_length += block[block_offset++];
+            state->payload_length_bytes_remaining--;
+        }
+        if (state->payload_length_bytes_remaining == 0) {
+            state->frame->message_length += state->payload_length;
+
+            if ((state->payload_length < 0) ||
+                (state->frame->message_length < 0) ||
+                (state->frame->message_length > conf->message_limit)) {
+                /* Invalid message length */
+                state->status_code = (server->state->protocol_version >= 13) ?
+                                      STATUS_CODE_MESSAGE_TOO_LARGE :
+                                      STATUS_CODE_RESERVED;
+                return 0;
+            }
+            else if (state->masking != 0) {
+                state->framing_state = DATA_FRAMING_MASK;
+            }
+            else {
+                state->framing_state = DATA_FRAMING_EXTENSION_DATA;
+                break;
+            }
+        }
+        if (block_offset >= block_size) {
+            break;  /* Only break if we need more data */
+        }
+
+    case DATA_FRAMING_MASK:
+        while ((state->mask_index < 4) && (block_offset < block_size)) {
+            state->mask[state->mask_index++] = block[block_offset++];
+        }
+        if (state->mask_index == 4) {
+            state->framing_state = DATA_FRAMING_EXTENSION_DATA;
+            state->mask_offset = 0;
+            state->mask_index = 0;
+            if ((state->mask[0] == 0) && (state->mask[1] == 0) &&
+                (state->mask[2] == 0) && (state->mask[3] == 0)) {
+                state->masking = 0;
+            }
+        }
+        else {
+            break;
+        }
+        /* Fall through */
+
+    case DATA_FRAMING_EXTENSION_DATA:
+        /* Deal with extension data when we support them -- FIXME */
+        if (state->extension_bytes_remaining == 0) {
+            if (state->payload_length > 0) {
+                state->frame->application_data = (unsigned char *)
+                    realloc(state->frame->application_data,
+                            state->frame->application_data_offset +
+                            state->payload_length);
+                if (state->frame->application_data == NULL) {
+                    state->status_code = (server->state->protocol_version >= 13) ?
+                                          STATUS_CODE_INTERNAL_ERROR :
+                                          STATUS_CODE_GOING_AWAY;
+                    return 0;
+                }
+            }
+            state->framing_state = DATA_FRAMING_APPLICATION_DATA;
+        }
+        /* Fall through */
+
+    case DATA_FRAMING_APPLICATION_DATA:
+    {
+        apr_int64_t block_data_length;
+        apr_int64_t block_length = 0;
+        apr_uint64_t application_data_offset =
+            state->frame->application_data_offset;
+        unsigned char *application_data = state->frame->application_data;
+
+        block_length = block_size - block_offset;
+        block_data_length = (state->payload_length > block_length) ?
+                            block_length : state->payload_length;
+
+        if (state->masking) {
+            apr_int64_t i;
+            int validate = 0; /* whether we need to validate UTF-8 */
+            apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
+
+            if (state->opcode == OPCODE_TEXT) {
+                validate = 1;
+            } else if (state->opcode == OPCODE_CLOSE) {
+                /*
+                 * Skip the first two status bytes of the response;
+                 * they're not part of the UTF-8 payload.
+                 */
+                validate = 1;
+                skip_bytes = 2;
+            }
+
+            if (validate) {
+                unsigned int utf8_state = state->frame->utf8_state;
+                unsigned char c;
+
+                for (i = 0; i < block_data_length; i++) {
+                    c = block[block_offset++] ^
+                        state->mask[state->mask_offset++ & 3];
+                    if (application_data_offset >= skip_bytes) {
+                        utf8_state = validate_utf8[utf8_state + c];
+                        if (utf8_state == UTF8_INVALID) {
+                            state->payload_length = block_data_length;
+                            break;
+                        }
+                    }
+                    application_data[application_data_offset++] = c;
+                }
+                state->frame->utf8_state = utf8_state;
+            }
+            else {
+                /* Need to optimize the unmasking -- FIXME */
+                for (i = 0; i < block_data_length; i++) {
+                    application_data[application_data_offset++] =
+                        block[block_offset++] ^
+                        state->mask[state->mask_offset++ & 3];
+                }
+            }
+        }
+        else if (block_data_length > 0) {
+            /* TODO: consolidate this code with the branch above. */
+            int validate = 0; /* whether we need to validate UTF-8 */
+            apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
+
+            memcpy(&application_data[application_data_offset],
+                   &block[block_offset], block_data_length);
+
+            if (state->opcode == OPCODE_TEXT) {
+                validate = 1;
+            } else if (state->opcode == OPCODE_CLOSE) {
+                /*
+                 * Skip the first two status bytes of the response;
+                 * they're not part of the UTF-8 payload.
+                 */
+                validate = 1;
+                skip_bytes = 2;
+            }
+
+            if (validate) {
+                apr_int64_t i;
+                apr_int64_t application_data_end = application_data_offset
+                                                   + block_data_length;
+                unsigned int utf8_state = state->frame->utf8_state;
+
+                for (i = application_data_offset; i < application_data_end; i++) {
+                    if (i >= skip_bytes) {
+                        utf8_state = validate_utf8[utf8_state +
+                                                   application_data[i]];
+                        if (utf8_state == UTF8_INVALID) {
+                            state->payload_length = block_data_length;
+                            break;
+                        }
+                    }
+                }
+                state->frame->utf8_state = utf8_state;
+            }
+            application_data_offset += block_data_length;
+            block_offset += block_data_length;
+        }
+        state->payload_length -= block_data_length;
+
+        if (state->payload_length == 0) {
+            int message_type = MESSAGE_TYPE_INVALID;
+
+            switch (state->opcode) {
+            case OPCODE_TEXT:
+                if ((state->fin &&
+                    (state->frame->utf8_state != UTF8_VALID)) ||
+                    (state->frame->utf8_state == UTF8_INVALID)) {
+                    state->status_code = STATUS_CODE_INVALID_UTF8;
+                    return 0;
+                }
+                message_type = MESSAGE_TYPE_TEXT;
+                break;
+
+            case OPCODE_BINARY:
+                message_type = MESSAGE_TYPE_BINARY;
+                break;
+
+            case OPCODE_CLOSE:
+                if (!is_valid_status_code(application_data,
+                                          application_data_offset,
+                                          !conf->allow_reserved)) {
+                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                } else if (state->frame->utf8_state != UTF8_VALID) {
+                    state->status_code = STATUS_CODE_INVALID_UTF8;
+                } else {
+                    state->status_code = STATUS_CODE_OK;
+                }
+                return 0;
+
+            case OPCODE_PING:
+                apr_thread_mutex_lock(server->state->mutex);
+                mod_websocket_send_internal(server->state, MESSAGE_TYPE_PONG,
+                                            application_data,
+                                            application_data_offset);
+                apr_thread_mutex_unlock(server->state->mutex);
+                break;
+
+            case OPCODE_PONG:
+                break;
+
+            default:
+                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                return 0;
+            }
+
+            if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
+                conf->plugin->on_message(plugin_private, server, message_type,
+                                         application_data,
+                                         application_data_offset);
+            }
+
+            /* Get ready for the next frame. */
+            state->framing_state = DATA_FRAMING_START;
+
+            if (state->fin) {
+                if (state->frame->application_data != NULL) {
+                    free(state->frame->application_data);
+                    state->frame->application_data = NULL;
+                }
+                state->frame->message_length = 0;
+                application_data_offset = 0;
+            }
+        }
+        state->frame->application_data_offset = application_data_offset;
+        break;
+    }
+
+    default:
+        state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+        return 0;
+    }
+
+    if (!block_offset) {
+        /* This shouldn't happen; we're supposed to have guaranteed forward
+         * progress for every call! */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, server->state->r,
+                      "mod_websocket_handle_frame made no forward progress");
+        state->status_code = STATUS_CODE_INTERNAL_ERROR;
+    }
+
+    return block_offset;
+}
+
+/**
+ * Handles as many bytes as possible from the given block, calling the plugin
+ * as necessary and storing interim state in the WebSocketReadState.
+ *
+ * Errors are indicated by setting the state->status_code and marking the
+ * connection for closure.
+ */
 static void mod_websocket_handle_incoming(const WebSocketServer *server,
                                           unsigned char *block,
                                           apr_size_t block_size,
@@ -1008,344 +1377,20 @@ static void mod_websocket_handle_incoming(const WebSocketServer *server,
                                           websocket_config_rec *conf,
                                           void *plugin_private)
 {
-    apr_size_t block_offset = 0;
+    apr_size_t handled_bytes;
 
-    while (block_offset < block_size) {
-        switch (state->framing_state) {
-        case DATA_FRAMING_START:
-            /*
-             * Since we don't currently support any extensions,
-             * the reserve bits must be 0
-             */
-            if ((FRAME_GET_RSV1(block[block_offset]) != 0) ||
-                (FRAME_GET_RSV2(block[block_offset]) != 0) ||
-                (FRAME_GET_RSV3(block[block_offset]) != 0)) {
-                state->framing_state = DATA_FRAMING_CLOSE;
-                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                break;
-            }
-            state->fin = FRAME_GET_FIN(block[block_offset]);
-            state->opcode = FRAME_GET_OPCODE(block[block_offset++]);
+    while (block_size > 0) {
+        handled_bytes = mod_websocket_handle_frame(server, block, block_size,
+                                                   state, conf, plugin_private);
 
-            state->framing_state = DATA_FRAMING_PAYLOAD_LENGTH;
-
-            if (state->opcode >= 0x8) { /* Control frame */
-                if (state->fin) {
-                    state->frame = &state->control_frame;
-                    state->frame->opcode = state->opcode;
-                    state->frame->utf8_state = UTF8_VALID;
-                }
-                else {
-                    state->framing_state = DATA_FRAMING_CLOSE;
-                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    break;
-                }
-            }
-            else { /* Message frame */
-                state->frame = &state->message_frame;
-                if (state->opcode) {
-                    if (state->frame->fin) {
-                        state->frame->opcode = state->opcode;
-                        state->frame->utf8_state = UTF8_VALID;
-                    }
-                    else {
-                        state->framing_state = DATA_FRAMING_CLOSE;
-                        state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                        break;
-                    }
-                }
-                else if (state->frame->fin ||
-                         ((state->opcode = state->frame->opcode) == 0)) {
-                    state->framing_state = DATA_FRAMING_CLOSE;
-                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    break;
-                }
-                state->frame->fin = state->fin;
-            }
-            state->payload_length = 0;
-            state->payload_length_bytes_remaining = 0;
-
-            if (block_offset >= block_size) {
-                break; /* Only break if we need more data */
-            }
-        case DATA_FRAMING_PAYLOAD_LENGTH:
-            state->payload_length = (apr_int64_t)
-                FRAME_GET_PAYLOAD_LEN(block[block_offset]);
-            state->masking = FRAME_GET_MASK(block[block_offset++]);
-
-            if (state->payload_length == 126) {
-                state->payload_length = 0;
-                state->payload_length_bytes_remaining = 2;
-            }
-            else if (state->payload_length == 127) {
-                state->payload_length = 0;
-                state->payload_length_bytes_remaining = 8;
-            }
-            else {
-                state->payload_length_bytes_remaining = 0;
-            }
-            if ((state->masking == 0) ||   /* Client-side mask is required */
-                ((state->opcode >= 0x8) && /* Control opcodes cannot have a payload larger than 125 bytes */
-                 (state->payload_length_bytes_remaining != 0)) ||
-                ((state->opcode == OPCODE_CLOSE) && /* Close payloads must be at least two bytes if not empty */
-                 (state->payload_length == 1))) {
-                state->framing_state = DATA_FRAMING_CLOSE;
-                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                break;
-            }
-            else {
-                state->framing_state = DATA_FRAMING_PAYLOAD_LENGTH_EXT;
-            }
-            if (block_offset >= block_size) {
-                break;  /* Only break if we need more data */
-            }
-        case DATA_FRAMING_PAYLOAD_LENGTH_EXT:
-            while ((state->payload_length_bytes_remaining > 0) &&
-                   (block_offset < block_size)) {
-                state->payload_length *= 256;
-                state->payload_length += block[block_offset++];
-                state->payload_length_bytes_remaining--;
-            }
-            if (state->payload_length_bytes_remaining == 0) {
-                state->frame->message_length += state->payload_length;
-
-                if ((state->payload_length < 0) ||
-                    (state->frame->message_length < 0) ||
-                    (state->frame->message_length > conf->message_limit)) {
-                    /* Invalid message length */
-                    state->framing_state = DATA_FRAMING_CLOSE;
-                    state->status_code = (server->state->protocol_version >= 13) ?
-                                          STATUS_CODE_MESSAGE_TOO_LARGE :
-                                          STATUS_CODE_RESERVED;
-                    break;
-                }
-                else if (state->masking != 0) {
-                    state->framing_state = DATA_FRAMING_MASK;
-                }
-                else {
-                    state->framing_state = DATA_FRAMING_EXTENSION_DATA;
-                    break;
-                }
-            }
-            if (block_offset >= block_size) {
-                break;  /* Only break if we need more data */
-            }
-        case DATA_FRAMING_MASK:
-            while ((state->mask_index < 4) && (block_offset < block_size)) {
-                state->mask[state->mask_index++] = block[block_offset++];
-            }
-            if (state->mask_index == 4) {
-                state->framing_state = DATA_FRAMING_EXTENSION_DATA;
-                state->mask_offset = 0;
-                state->mask_index = 0;
-                if ((state->mask[0] == 0) && (state->mask[1] == 0) &&
-                    (state->mask[2] == 0) && (state->mask[3] == 0)) {
-                    state->masking = 0;
-                }
-            }
-            else {
-                break;
-            }
-            /* Fall through */
-        case DATA_FRAMING_EXTENSION_DATA:
-            /* Deal with extension data when we support them -- FIXME */
-            if (state->extension_bytes_remaining == 0) {
-                if (state->payload_length > 0) {
-                    state->frame->application_data = (unsigned char *)
-                        realloc(state->frame->application_data,
-                                state->frame->application_data_offset +
-                                state->payload_length);
-                    if (state->frame->application_data == NULL) {
-                        state->framing_state = DATA_FRAMING_CLOSE;
-                        state->status_code = (server->state->protocol_version >= 13) ?
-                                              STATUS_CODE_INTERNAL_ERROR :
-                                              STATUS_CODE_GOING_AWAY;
-                        break;
-                    }
-                }
-                state->framing_state = DATA_FRAMING_APPLICATION_DATA;
-            }
-            /* Fall through */
-        case DATA_FRAMING_APPLICATION_DATA:
-            {
-                apr_int64_t block_data_length;
-                apr_int64_t block_length = 0;
-                apr_uint64_t application_data_offset =
-                    state->frame->application_data_offset;
-                unsigned char *application_data =
-                    state->frame->application_data;
-
-                block_length = block_size - block_offset;
-                block_data_length =
-                    (state->payload_length >
-                     block_length) ? block_length : state->payload_length;
-
-                if (state->masking) {
-                    apr_int64_t i;
-                    int validate = 0; /* whether we need to validate UTF-8 */
-                    apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
-
-                    if (state->opcode == OPCODE_TEXT) {
-                        validate = 1;
-                    } else if (state->opcode == OPCODE_CLOSE) {
-                        /*
-                         * Skip the first two status bytes of the response;
-                         * they're not part of the UTF-8 payload.
-                         */
-                        validate = 1;
-                        skip_bytes = 2;
-                    }
-
-                    if (validate) {
-                        unsigned int utf8_state = state->frame->utf8_state;
-                        unsigned char c;
-
-                        for (i = 0; i < block_data_length; i++) {
-                            c = block[block_offset++] ^
-                                state->mask[state->mask_offset++ & 3];
-                            if (application_data_offset >= skip_bytes) {
-                                utf8_state =
-                                    validate_utf8[utf8_state + c];
-                                if (utf8_state == UTF8_INVALID) {
-                                    state->payload_length = block_data_length;
-                                    break;
-                                }
-                            }
-                            application_data
-                                [application_data_offset++] = c;
-                        }
-                        state->frame->utf8_state = utf8_state;
-                    }
-                    else {
-                        /* Need to optimize the unmasking -- FIXME */
-                        for (i = 0; i < block_data_length; i++) {
-                            application_data
-                                [application_data_offset++] =
-                                block[block_offset++] ^
-                                state->mask[state->mask_offset++ & 3];
-                        }
-                    }
-                }
-                else if (block_data_length > 0) {
-                    /* TODO: consolidate this code with the branch above. */
-                    int validate = 0; /* whether we need to validate UTF-8 */
-                    apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
-
-                    memcpy(&application_data[application_data_offset],
-                           &block[block_offset], block_data_length);
-
-                    if (state->opcode == OPCODE_TEXT) {
-                        validate = 1;
-                    } else if (state->opcode == OPCODE_CLOSE) {
-                        /*
-                         * Skip the first two status bytes of the response;
-                         * they're not part of the UTF-8 payload.
-                         */
-                        validate = 1;
-                        skip_bytes = 2;
-                    }
-
-                    if (validate) {
-                        apr_int64_t i, application_data_end =
-                            application_data_offset +
-                            block_data_length;
-                        unsigned int utf8_state = state->frame->utf8_state;
-
-                        for (i = application_data_offset;
-                             i < application_data_end; i++) {
-                            if (i >= skip_bytes) {
-                                utf8_state =
-                                    validate_utf8[utf8_state +
-                                                  application_data[i]];
-                                if (utf8_state == UTF8_INVALID) {
-                                    state->payload_length = block_data_length;
-                                    break;
-                                }
-                            }
-                        }
-                        state->frame->utf8_state = utf8_state;
-                    }
-                    application_data_offset += block_data_length;
-                    block_offset += block_data_length;
-                }
-                state->payload_length -= block_data_length;
-
-                if (state->payload_length == 0) {
-                    int message_type = MESSAGE_TYPE_INVALID;
-
-                    switch (state->opcode) {
-                    case OPCODE_TEXT:
-                        if ((state->fin &&
-                            (state->frame->utf8_state != UTF8_VALID)) ||
-                            (state->frame->utf8_state == UTF8_INVALID)) {
-                            state->framing_state = DATA_FRAMING_CLOSE;
-                            state->status_code = STATUS_CODE_INVALID_UTF8;
-                        }
-                        else {
-                            message_type = MESSAGE_TYPE_TEXT;
-                        }
-                        break;
-                    case OPCODE_BINARY:
-                        message_type = MESSAGE_TYPE_BINARY;
-                        break;
-                    case OPCODE_CLOSE:
-                        state->framing_state = DATA_FRAMING_CLOSE;
-                        if (!is_valid_status_code(application_data,
-                                                  application_data_offset,
-                                                  !conf->allow_reserved)) {
-                            state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                        } else if (state->frame->utf8_state != UTF8_VALID) {
-                            state->status_code = STATUS_CODE_INVALID_UTF8;
-                        } else {
-                            state->status_code = STATUS_CODE_OK;
-                        }
-                        break;
-                    case OPCODE_PING:
-                        apr_thread_mutex_lock(server->state->mutex);
-                        mod_websocket_send_internal(server->state,
-                                                    MESSAGE_TYPE_PONG,
-                                                    application_data,
-                                                    application_data_offset);
-                        apr_thread_mutex_unlock(server->state->mutex);
-                        break;
-                    case OPCODE_PONG:
-                        break;
-                    default:
-                        state->framing_state = DATA_FRAMING_CLOSE;
-                        state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                        break;
-                    }
-                    if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
-                        conf->plugin->on_message(plugin_private,
-                                                 server, message_type,
-                                                 application_data,
-                                                 application_data_offset);
-                    }
-                    if (state->framing_state != DATA_FRAMING_CLOSE) {
-                        state->framing_state = DATA_FRAMING_START;
-
-                        if (state->fin) {
-                            if (state->frame->application_data != NULL) {
-                                free(state->frame->application_data);
-                                state->frame->application_data = NULL;
-                            }
-                            state->frame->message_length = 0;
-                            application_data_offset = 0;
-                        }
-                    }
-                }
-                state->frame->application_data_offset =
-                    application_data_offset;
-            }
-            break;
-        case DATA_FRAMING_CLOSE:
-            block_offset = block_size;
-            break;
-        default:
-            state->framing_state = DATA_FRAMING_CLOSE;
-            state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-            break;
+        if (!handled_bytes) {
+            /* Close the connection. */
+            state->closing = 1;
+            return;
         }
+
+        block += handled_bytes;
+        block_size -= handled_bytes;
     }
 }
 
@@ -1449,7 +1494,7 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
          * the client and data coming from the server. Only block in poll() if
          * there is no work to be done for either side.
          */
-        while ((read_state.framing_state != DATA_FRAMING_CLOSE)) {
+        while (!read_state.closing) {
             apr_status_t rv;
             apr_interval_time_t timeout;
             WebSocketMessageData *msg;
