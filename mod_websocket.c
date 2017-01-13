@@ -1001,6 +1001,15 @@ static int is_trusted_origin(request_rec *r, websocket_config_rec *conf,
     return 0;
 }
 
+/**
+ * Reads from the given data block until the end of the block or a frame
+ * boundary is encountered, handling plugin callbacks as messages are received.
+ *
+ * Returns the number of bytes parsed from the block. (At least one byte is
+ * guaranteed to be handled per call, so the block must not be empty.) A return
+ * value of zero indicates that the rest of the block is to be discarded and the
+ * connection closed; state->status_code will be set accordingly.
+ */
 static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                                              unsigned char *block,
                                              apr_size_t block_size,
@@ -1009,6 +1018,16 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                                              void *plugin_private)
 {
     apr_size_t block_offset = 0;
+
+    if (!block_size || (state->framing_state == DATA_FRAMING_CLOSE)) {
+        /* handled_incoming() shouldn't be calling us in this case */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, server->state->r,
+                      "mod_websocket_handle_frame called %s",
+                      (block_size ? "after close" : "with empty block"));
+
+        state->status_code = STATUS_CODE_INTERNAL_ERROR;
+        return 0;
+    }
 
     switch (state->framing_state) {
     case DATA_FRAMING_START:
@@ -1019,9 +1038,8 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
         if ((FRAME_GET_RSV1(block[block_offset]) != 0) ||
             (FRAME_GET_RSV2(block[block_offset]) != 0) ||
             (FRAME_GET_RSV3(block[block_offset]) != 0)) {
-            state->framing_state = DATA_FRAMING_CLOSE;
             state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-            break;
+            return 0;
         }
         state->fin = FRAME_GET_FIN(block[block_offset]);
         state->opcode = FRAME_GET_OPCODE(block[block_offset++]);
@@ -1035,9 +1053,8 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 state->frame->utf8_state = UTF8_VALID;
             }
             else {
-                state->framing_state = DATA_FRAMING_CLOSE;
                 state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                break;
+                return 0;
             }
         }
         else { /* Message frame */
@@ -1048,16 +1065,14 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                     state->frame->utf8_state = UTF8_VALID;
                 }
                 else {
-                    state->framing_state = DATA_FRAMING_CLOSE;
                     state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    break;
+                    return 0;
                 }
             }
             else if (state->frame->fin ||
                      ((state->opcode = state->frame->opcode) == 0)) {
-                state->framing_state = DATA_FRAMING_CLOSE;
                 state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                break;
+                return 0;
             }
             state->frame->fin = state->fin;
         }
@@ -1088,9 +1103,8 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
              (state->payload_length_bytes_remaining != 0)) ||
             ((state->opcode == OPCODE_CLOSE) && /* Close payloads must be at least two bytes if not empty */
              (state->payload_length == 1))) {
-            state->framing_state = DATA_FRAMING_CLOSE;
             state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-            break;
+            return 0;
         }
         else {
             state->framing_state = DATA_FRAMING_PAYLOAD_LENGTH_EXT;
@@ -1112,11 +1126,10 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 (state->frame->message_length < 0) ||
                 (state->frame->message_length > conf->message_limit)) {
                 /* Invalid message length */
-                state->framing_state = DATA_FRAMING_CLOSE;
                 state->status_code = (server->state->protocol_version >= 13) ?
                                       STATUS_CODE_MESSAGE_TOO_LARGE :
                                       STATUS_CODE_RESERVED;
-                break;
+                return 0;
             }
             else if (state->masking != 0) {
                 state->framing_state = DATA_FRAMING_MASK;
@@ -1155,11 +1168,10 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                             state->frame->application_data_offset +
                             state->payload_length);
                 if (state->frame->application_data == NULL) {
-                    state->framing_state = DATA_FRAMING_CLOSE;
                     state->status_code = (server->state->protocol_version >= 13) ?
                                           STATUS_CODE_INTERNAL_ERROR :
                                           STATUS_CODE_GOING_AWAY;
-                    break;
+                    return 0;
                 }
             }
             state->framing_state = DATA_FRAMING_APPLICATION_DATA;
@@ -1277,18 +1289,15 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                     if ((state->fin &&
                         (state->frame->utf8_state != UTF8_VALID)) ||
                         (state->frame->utf8_state == UTF8_INVALID)) {
-                        state->framing_state = DATA_FRAMING_CLOSE;
                         state->status_code = STATUS_CODE_INVALID_UTF8;
+                        return 0;
                     }
-                    else {
-                        message_type = MESSAGE_TYPE_TEXT;
-                    }
+                    message_type = MESSAGE_TYPE_TEXT;
                     break;
                 case OPCODE_BINARY:
                     message_type = MESSAGE_TYPE_BINARY;
                     break;
                 case OPCODE_CLOSE:
-                    state->framing_state = DATA_FRAMING_CLOSE;
                     if (!is_valid_status_code(application_data,
                                               application_data_offset,
                                               !conf->allow_reserved)) {
@@ -1298,7 +1307,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                     } else {
                         state->status_code = STATUS_CODE_OK;
                     }
-                    break;
+                    return 0;
                 case OPCODE_PING:
                     apr_thread_mutex_lock(server->state->mutex);
                     mod_websocket_send_internal(server->state,
@@ -1310,45 +1319,56 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
                 case OPCODE_PONG:
                     break;
                 default:
-                    state->framing_state = DATA_FRAMING_CLOSE;
                     state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    break;
+                    return 0;
                 }
+
                 if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
                     conf->plugin->on_message(plugin_private,
                                              server, message_type,
                                              application_data,
                                              application_data_offset);
                 }
-                if (state->framing_state != DATA_FRAMING_CLOSE) {
-                    state->framing_state = DATA_FRAMING_START;
 
-                    if (state->fin) {
-                        if (state->frame->application_data != NULL) {
-                            free(state->frame->application_data);
-                            state->frame->application_data = NULL;
-                        }
-                        state->frame->message_length = 0;
-                        application_data_offset = 0;
+                /* Get ready for the next frame. */
+                state->framing_state = DATA_FRAMING_START;
+
+                if (state->fin) {
+                    if (state->frame->application_data != NULL) {
+                        free(state->frame->application_data);
+                        state->frame->application_data = NULL;
                     }
+                    state->frame->message_length = 0;
+                    application_data_offset = 0;
                 }
             }
             state->frame->application_data_offset =
                 application_data_offset;
         }
         break;
-    case DATA_FRAMING_CLOSE:
-        block_offset = block_size;
-        break;
     default:
-        state->framing_state = DATA_FRAMING_CLOSE;
         state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-        break;
+        return 0;
+    }
+
+    if (!block_offset) {
+        /* This shouldn't happen; we're supposed to have guaranteed forward
+         * progress for every call! */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, server->state->r,
+                      "mod_websocket_handle_frame made no forward progress");
+        state->status_code = STATUS_CODE_INTERNAL_ERROR;
     }
 
     return block_offset;
 }
 
+/**
+ * Handles as many bytes as possible from the given block, calling the plugin
+ * as necessary and storing interim state in the WebSocketReadState.
+ *
+ * Errors are indicated by setting the state->status_code and marking the
+ * connection for closure.
+ */
 static void mod_websocket_handle_incoming(const WebSocketServer *server,
                                           unsigned char *block,
                                           apr_size_t block_size,
@@ -1361,6 +1381,12 @@ static void mod_websocket_handle_incoming(const WebSocketServer *server,
     while (block_size > 0) {
         handled_bytes = mod_websocket_handle_frame(server, block, block_size,
                                                    state, conf, plugin_private);
+
+        if (!handled_bytes) {
+            /* Close the connection. */
+            state->framing_state = DATA_FRAMING_CLOSE;
+            return;
+        }
 
         block += handled_bytes;
         block_size -= handled_bytes;
