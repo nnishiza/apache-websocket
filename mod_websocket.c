@@ -1082,6 +1082,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
         if (block_offset >= block_size) {
             break; /* Only break if we need more data */
         }
+
     case DATA_FRAMING_PAYLOAD_LENGTH:
         state->payload_length = (apr_int64_t)
             FRAME_GET_PAYLOAD_LEN(block[block_offset]);
@@ -1112,6 +1113,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
         if (block_offset >= block_size) {
             break;  /* Only break if we need more data */
         }
+
     case DATA_FRAMING_PAYLOAD_LENGTH_EXT:
         while ((state->payload_length_bytes_remaining > 0) &&
                (block_offset < block_size)) {
@@ -1142,6 +1144,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
         if (block_offset >= block_size) {
             break;  /* Only break if we need more data */
         }
+
     case DATA_FRAMING_MASK:
         while ((state->mask_index < 4) && (block_offset < block_size)) {
             state->mask[state->mask_index++] = block[block_offset++];
@@ -1159,6 +1162,7 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
             break;
         }
         /* Fall through */
+
     case DATA_FRAMING_EXTENSION_DATA:
         /* Deal with extension data when we support them -- FIXME */
         if (state->extension_bytes_remaining == 0) {
@@ -1177,175 +1181,172 @@ static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
             state->framing_state = DATA_FRAMING_APPLICATION_DATA;
         }
         /* Fall through */
+
     case DATA_FRAMING_APPLICATION_DATA:
-        {
-            apr_int64_t block_data_length;
-            apr_int64_t block_length = 0;
-            apr_uint64_t application_data_offset =
-                state->frame->application_data_offset;
-            unsigned char *application_data =
-                state->frame->application_data;
+    {
+        apr_int64_t block_data_length;
+        apr_int64_t block_length = 0;
+        apr_uint64_t application_data_offset =
+            state->frame->application_data_offset;
+        unsigned char *application_data = state->frame->application_data;
 
-            block_length = block_size - block_offset;
-            block_data_length =
-                (state->payload_length >
-                 block_length) ? block_length : state->payload_length;
+        block_length = block_size - block_offset;
+        block_data_length = (state->payload_length > block_length) ?
+                            block_length : state->payload_length;
 
-            if (state->masking) {
-                apr_int64_t i;
-                int validate = 0; /* whether we need to validate UTF-8 */
-                apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
+        if (state->masking) {
+            apr_int64_t i;
+            int validate = 0; /* whether we need to validate UTF-8 */
+            apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
 
-                if (state->opcode == OPCODE_TEXT) {
-                    validate = 1;
-                } else if (state->opcode == OPCODE_CLOSE) {
-                    /*
-                     * Skip the first two status bytes of the response;
-                     * they're not part of the UTF-8 payload.
-                     */
-                    validate = 1;
-                    skip_bytes = 2;
-                }
-
-                if (validate) {
-                    unsigned int utf8_state = state->frame->utf8_state;
-                    unsigned char c;
-
-                    for (i = 0; i < block_data_length; i++) {
-                        c = block[block_offset++] ^
-                            state->mask[state->mask_offset++ & 3];
-                        if (application_data_offset >= skip_bytes) {
-                            utf8_state =
-                                validate_utf8[utf8_state + c];
-                            if (utf8_state == UTF8_INVALID) {
-                                state->payload_length = block_data_length;
-                                break;
-                            }
-                        }
-                        application_data
-                            [application_data_offset++] = c;
-                    }
-                    state->frame->utf8_state = utf8_state;
-                }
-                else {
-                    /* Need to optimize the unmasking -- FIXME */
-                    for (i = 0; i < block_data_length; i++) {
-                        application_data
-                            [application_data_offset++] =
-                            block[block_offset++] ^
-                            state->mask[state->mask_offset++ & 3];
-                    }
-                }
+            if (state->opcode == OPCODE_TEXT) {
+                validate = 1;
+            } else if (state->opcode == OPCODE_CLOSE) {
+                /*
+                 * Skip the first two status bytes of the response;
+                 * they're not part of the UTF-8 payload.
+                 */
+                validate = 1;
+                skip_bytes = 2;
             }
-            else if (block_data_length > 0) {
-                /* TODO: consolidate this code with the branch above. */
-                int validate = 0; /* whether we need to validate UTF-8 */
-                apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
 
-                memcpy(&application_data[application_data_offset],
-                       &block[block_offset], block_data_length);
+            if (validate) {
+                unsigned int utf8_state = state->frame->utf8_state;
+                unsigned char c;
 
-                if (state->opcode == OPCODE_TEXT) {
-                    validate = 1;
-                } else if (state->opcode == OPCODE_CLOSE) {
-                    /*
-                     * Skip the first two status bytes of the response;
-                     * they're not part of the UTF-8 payload.
-                     */
-                    validate = 1;
-                    skip_bytes = 2;
-                }
-
-                if (validate) {
-                    apr_int64_t i, application_data_end =
-                        application_data_offset +
-                        block_data_length;
-                    unsigned int utf8_state = state->frame->utf8_state;
-
-                    for (i = application_data_offset;
-                         i < application_data_end; i++) {
-                        if (i >= skip_bytes) {
-                            utf8_state =
-                                validate_utf8[utf8_state +
-                                              application_data[i]];
-                            if (utf8_state == UTF8_INVALID) {
-                                state->payload_length = block_data_length;
-                                break;
-                            }
+                for (i = 0; i < block_data_length; i++) {
+                    c = block[block_offset++] ^
+                        state->mask[state->mask_offset++ & 3];
+                    if (application_data_offset >= skip_bytes) {
+                        utf8_state = validate_utf8[utf8_state + c];
+                        if (utf8_state == UTF8_INVALID) {
+                            state->payload_length = block_data_length;
+                            break;
                         }
                     }
-                    state->frame->utf8_state = utf8_state;
+                    application_data[application_data_offset++] = c;
                 }
-                application_data_offset += block_data_length;
-                block_offset += block_data_length;
+                state->frame->utf8_state = utf8_state;
             }
-            state->payload_length -= block_data_length;
-
-            if (state->payload_length == 0) {
-                int message_type = MESSAGE_TYPE_INVALID;
-
-                switch (state->opcode) {
-                case OPCODE_TEXT:
-                    if ((state->fin &&
-                        (state->frame->utf8_state != UTF8_VALID)) ||
-                        (state->frame->utf8_state == UTF8_INVALID)) {
-                        state->status_code = STATUS_CODE_INVALID_UTF8;
-                        return 0;
-                    }
-                    message_type = MESSAGE_TYPE_TEXT;
-                    break;
-                case OPCODE_BINARY:
-                    message_type = MESSAGE_TYPE_BINARY;
-                    break;
-                case OPCODE_CLOSE:
-                    if (!is_valid_status_code(application_data,
-                                              application_data_offset,
-                                              !conf->allow_reserved)) {
-                        state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    } else if (state->frame->utf8_state != UTF8_VALID) {
-                        state->status_code = STATUS_CODE_INVALID_UTF8;
-                    } else {
-                        state->status_code = STATUS_CODE_OK;
-                    }
-                    return 0;
-                case OPCODE_PING:
-                    apr_thread_mutex_lock(server->state->mutex);
-                    mod_websocket_send_internal(server->state,
-                                                MESSAGE_TYPE_PONG,
-                                                application_data,
-                                                application_data_offset);
-                    apr_thread_mutex_unlock(server->state->mutex);
-                    break;
-                case OPCODE_PONG:
-                    break;
-                default:
-                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
-                    return 0;
-                }
-
-                if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
-                    conf->plugin->on_message(plugin_private,
-                                             server, message_type,
-                                             application_data,
-                                             application_data_offset);
-                }
-
-                /* Get ready for the next frame. */
-                state->framing_state = DATA_FRAMING_START;
-
-                if (state->fin) {
-                    if (state->frame->application_data != NULL) {
-                        free(state->frame->application_data);
-                        state->frame->application_data = NULL;
-                    }
-                    state->frame->message_length = 0;
-                    application_data_offset = 0;
+            else {
+                /* Need to optimize the unmasking -- FIXME */
+                for (i = 0; i < block_data_length; i++) {
+                    application_data[application_data_offset++] =
+                        block[block_offset++] ^
+                        state->mask[state->mask_offset++ & 3];
                 }
             }
-            state->frame->application_data_offset =
-                application_data_offset;
         }
+        else if (block_data_length > 0) {
+            /* TODO: consolidate this code with the branch above. */
+            int validate = 0; /* whether we need to validate UTF-8 */
+            apr_int64_t skip_bytes = 0; /* number of bytes to skip during validation */
+
+            memcpy(&application_data[application_data_offset],
+                   &block[block_offset], block_data_length);
+
+            if (state->opcode == OPCODE_TEXT) {
+                validate = 1;
+            } else if (state->opcode == OPCODE_CLOSE) {
+                /*
+                 * Skip the first two status bytes of the response;
+                 * they're not part of the UTF-8 payload.
+                 */
+                validate = 1;
+                skip_bytes = 2;
+            }
+
+            if (validate) {
+                apr_int64_t i;
+                apr_int64_t application_data_end = application_data_offset
+                                                   + block_data_length;
+                unsigned int utf8_state = state->frame->utf8_state;
+
+                for (i = application_data_offset; i < application_data_end; i++) {
+                    if (i >= skip_bytes) {
+                        utf8_state = validate_utf8[utf8_state +
+                                                   application_data[i]];
+                        if (utf8_state == UTF8_INVALID) {
+                            state->payload_length = block_data_length;
+                            break;
+                        }
+                    }
+                }
+                state->frame->utf8_state = utf8_state;
+            }
+            application_data_offset += block_data_length;
+            block_offset += block_data_length;
+        }
+        state->payload_length -= block_data_length;
+
+        if (state->payload_length == 0) {
+            int message_type = MESSAGE_TYPE_INVALID;
+
+            switch (state->opcode) {
+            case OPCODE_TEXT:
+                if ((state->fin &&
+                    (state->frame->utf8_state != UTF8_VALID)) ||
+                    (state->frame->utf8_state == UTF8_INVALID)) {
+                    state->status_code = STATUS_CODE_INVALID_UTF8;
+                    return 0;
+                }
+                message_type = MESSAGE_TYPE_TEXT;
+                break;
+
+            case OPCODE_BINARY:
+                message_type = MESSAGE_TYPE_BINARY;
+                break;
+
+            case OPCODE_CLOSE:
+                if (!is_valid_status_code(application_data,
+                                          application_data_offset,
+                                          !conf->allow_reserved)) {
+                    state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                } else if (state->frame->utf8_state != UTF8_VALID) {
+                    state->status_code = STATUS_CODE_INVALID_UTF8;
+                } else {
+                    state->status_code = STATUS_CODE_OK;
+                }
+                return 0;
+
+            case OPCODE_PING:
+                apr_thread_mutex_lock(server->state->mutex);
+                mod_websocket_send_internal(server->state, MESSAGE_TYPE_PONG,
+                                            application_data,
+                                            application_data_offset);
+                apr_thread_mutex_unlock(server->state->mutex);
+                break;
+
+            case OPCODE_PONG:
+                break;
+
+            default:
+                state->status_code = STATUS_CODE_PROTOCOL_ERROR;
+                return 0;
+            }
+
+            if (state->fin && (message_type != MESSAGE_TYPE_INVALID)) {
+                conf->plugin->on_message(plugin_private, server, message_type,
+                                         application_data,
+                                         application_data_offset);
+            }
+
+            /* Get ready for the next frame. */
+            state->framing_state = DATA_FRAMING_START;
+
+            if (state->fin) {
+                if (state->frame->application_data != NULL) {
+                    free(state->frame->application_data);
+                    state->frame->application_data = NULL;
+                }
+                state->frame->message_length = 0;
+                application_data_offset = 0;
+            }
+        }
+        state->frame->application_data_offset = application_data_offset;
         break;
+    }
+
     default:
         state->status_code = STATUS_CODE_PROTOCOL_ERROR;
         return 0;
