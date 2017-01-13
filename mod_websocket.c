@@ -1001,15 +1001,14 @@ static int is_trusted_origin(request_rec *r, websocket_config_rec *conf,
     return 0;
 }
 
-static void mod_websocket_handle_frame(const WebSocketServer *server,
-                                       unsigned char *block,
-                                       apr_size_t block_size,
-                                       apr_size_t *offset,
-                                       WebSocketReadState *state,
-                                       websocket_config_rec *conf,
-                                       void *plugin_private)
+static apr_size_t mod_websocket_handle_frame(const WebSocketServer *server,
+                                             unsigned char *block,
+                                             apr_size_t block_size,
+                                             WebSocketReadState *state,
+                                             websocket_config_rec *conf,
+                                             void *plugin_private)
 {
-    apr_size_t block_offset = *offset;
+    apr_size_t block_offset = 0;
 
     switch (state->framing_state) {
     case DATA_FRAMING_START:
@@ -1347,7 +1346,7 @@ static void mod_websocket_handle_frame(const WebSocketServer *server,
         break;
     }
 
-    *offset = block_offset;
+    return block_offset;
 }
 
 static void mod_websocket_handle_incoming(const WebSocketServer *server,
@@ -1357,11 +1356,14 @@ static void mod_websocket_handle_incoming(const WebSocketServer *server,
                                           websocket_config_rec *conf,
                                           void *plugin_private)
 {
-    apr_size_t block_offset = 0;
+    apr_size_t handled_bytes;
 
-    while (block_offset < block_size) {
-        mod_websocket_handle_frame(server, block, block_size, &block_offset,
-                                   state, conf, plugin_private);
+    while (block_size > 0) {
+        handled_bytes = mod_websocket_handle_frame(server, block, block_size,
+                                                   state, conf, plugin_private);
+
+        block += handled_bytes;
+        block_size -= handled_bytes;
     }
 }
 
