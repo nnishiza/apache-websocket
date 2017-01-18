@@ -90,7 +90,7 @@ $(TEST_MODULES_ALL_PATHS):
 	mkdir -p $(TEST_MODULEDIR)
 	$(LIBTOOL) --silent --mode=install cp $< $(abspath $@)
 
-start-test-server: test-modules test-folders
+start-test-server restart-test-server: test-modules test-folders
 start-test-server restart-test-server stop-test-server:
 	$(HTTPD) -d "$(CURDIR)/test/httpd" -f test.conf \
 	         -k $(patsubst %-test-server,%,$@)
