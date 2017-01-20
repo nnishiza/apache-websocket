@@ -3,8 +3,9 @@ import pytest
 
 from twisted.internet import defer
 
+from testutil.fixtures import fixture_connect
+from testutil.protocols import SimpleProtocol
 from testutil.websocket import make_root, SCHEME
-from testutil.protocols import ProtocolFactory, SimpleProtocol
 
 CLOSE_CODE_PROTOCOL_ERROR = 1002
 
@@ -37,19 +38,8 @@ def failed(code):
 #
 
 def connect(uri):
-    """
-    Constructs a ProtocolFactory, connects to the desired WebSocket endpoint
-    URI, waits for the CloseTestProtocol to be constructed, and then returns the
-    protocol instance.
-    """
-    factory = ProtocolFactory(uri, CloseTestProtocol)
-    factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
-
-    ws.connectWS(factory, timeout=1)
-    protocol = pytest.blockon(factory.connected)
-
-    pytest.blockon(protocol.opened)
-    return protocol
+    """Helper wrapper for fixture_connect."""
+    return fixture_connect(uri, CloseTestProtocol)
 
 @pytest.fixture
 def default_proto():

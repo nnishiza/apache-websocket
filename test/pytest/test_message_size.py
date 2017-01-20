@@ -4,8 +4,9 @@ import struct
 
 from twisted.internet import defer
 
+from testutil.fixtures import fixture_connect
+from testutil.protocols import SimpleProtocol
 from testutil.websocket import make_root, SCHEME
-from testutil.protocols import ProtocolFactory, SimpleProtocol
 
 CLOSE_CODE_NORMAL_CLOSURE  = 1000
 CLOSE_CODE_MESSAGE_TOO_BIG = 1009
@@ -20,19 +21,8 @@ ROOT = make_root("wss" if (SCHEME == "https") else "ws")
 #
 
 def connect(uri):
-    """
-    Constructs a ProtocolFactory, connects to the desired WebSocket endpoint
-    URI, waits for the SimpleProtocol to be constructed, and then returns the
-    protocol instance.
-    """
-    factory = ProtocolFactory(uri, SimpleProtocol)
-    factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
-
-    ws.connectWS(factory, timeout=1)
-    protocol = pytest.blockon(factory.connected)
-
-    pytest.blockon(protocol.opened)
-    return protocol
+    """Helper wrapper for fixture_connect."""
+    return fixture_connect(uri, SimpleProtocol)
 
 @pytest.fixture
 def proto():

@@ -1,9 +1,12 @@
+import autobahn.twisted.websocket as ws
 import pytest
 import urlparse
 
 from twisted.internet import reactor
 from twisted.internet.ssl import ClientContextFactory
 from twisted.web import client
+
+from .protocols import ProtocolFactory
 
 class _UnsecureClientContextFactory(ClientContextFactory):
     """An SSL context factory that performs no cert checks."""
@@ -58,6 +61,27 @@ class _HTTP10Agent:
 
         return f.deferred
 
+#
+# Fixture Helper Functions
+#
+
+def fixture_connect(uri, protocol):
+    """
+    Connects to the given WebSocket URI using an instance of the provided
+    WebSocketClientProtocol subclass.
+
+    This is intended to be called by pytest fixtures; it will block until a
+    connection is made and return the protocol instance that wraps the
+    connection.
+    """
+    factory = ProtocolFactory(uri, protocol)
+    factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
+
+    ws.connectWS(factory, timeout=1)
+    protocol = pytest.blockon(factory.connected)
+
+    pytest.blockon(protocol.opened)
+    return protocol
 
 #
 # Fixtures
