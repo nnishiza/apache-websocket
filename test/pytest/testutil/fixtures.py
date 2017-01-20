@@ -75,7 +75,9 @@ def fixture_connect(uri, protocol):
     connection.
     """
     factory = ProtocolFactory(uri, protocol)
-    factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
+    factory.setProtocolOptions(failByDrop=False,
+                               openHandshakeTimeout=1,
+                               closeHandshakeTimeout=1)
 
     ws.connectWS(factory, timeout=1)
     protocol = pytest.blockon(factory.connected)
