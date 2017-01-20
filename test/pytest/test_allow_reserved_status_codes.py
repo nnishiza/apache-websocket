@@ -4,7 +4,7 @@ import pytest
 from twisted.internet import defer
 
 from testutil.websocket import make_root, SCHEME
-from testutil.protocols import ProtocolFactory
+from testutil.protocols import ProtocolFactory, SimpleProtocol
 
 CLOSE_CODE_PROTOCOL_ERROR = 1002
 
@@ -14,26 +14,10 @@ ROOT = make_root("wss" if (SCHEME == "https") else "ws")
 # Autobahn Subclasses
 #
 
-class CloseTestProtocol(ws.WebSocketClientProtocol):
+class CloseTestProtocol(SimpleProtocol):
     """
-    Implements WebSocketClientProtocol for the close tests.
-
-    The opened and closed attributes are Deferreds that can be waited on. The
-    closed Deferred will return the received close code in its callback.
+    A version of SimpleProtocol that allows invalid close codes to be sent.
     """
-    def __init__(self):
-        ws.WebSocketClientProtocol.__init__(self)
-
-        self.opened = defer.Deferred()
-        self.closed = defer.Deferred()
-
-    def onOpen(self):
-        self.opened.callback(None)
-
-    def onClose(self, wasClean, code, reason):
-        assert wasClean
-        self.closed.callback(code)
-
     # XXX Monkey-patch sendClose() to allow invalid codes on the wire.
     def sendClose(self, code=None, reason=None):
         self.sendCloseFrame(code=code, isReply=False)

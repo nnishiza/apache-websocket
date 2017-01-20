@@ -5,7 +5,7 @@ import struct
 from twisted.internet import defer
 
 from testutil.websocket import make_root, SCHEME
-from testutil.protocols import ProtocolFactory
+from testutil.protocols import ProtocolFactory, SimpleProtocol
 
 CLOSE_CODE_NORMAL_CLOSURE  = 1000
 CLOSE_CODE_MESSAGE_TOO_BIG = 1009
@@ -16,40 +16,16 @@ OPCODE_TEXT         = 0x1
 ROOT = make_root("wss" if (SCHEME == "https") else "ws")
 
 #
-# Autobahn Subclasses
-#
-
-class MessageTestProtocol(ws.WebSocketClientProtocol):
-    """
-    Implements WebSocketClientProtocol for the message tests.
-
-    The opened and closed attributes are Deferreds that can be waited on. The
-    closed Deferred will return the received close code in its callback.
-    """
-    def __init__(self):
-        ws.WebSocketClientProtocol.__init__(self)
-
-        self.opened = defer.Deferred()
-        self.closed = defer.Deferred()
-
-    def onOpen(self):
-        self.opened.callback(None)
-
-    def onClose(self, wasClean, code, reason):
-        assert wasClean
-        self.closed.callback(code)
-
-#
 # Fixtures
 #
 
 def connect(uri):
     """
     Constructs a ProtocolFactory, connects to the desired WebSocket endpoint
-    URI, waits for the MessageTestProtocol to be constructed, and then returns
-    the protocol instance.
+    URI, waits for the SimpleProtocol to be constructed, and then returns the
+    protocol instance.
     """
-    factory = ProtocolFactory(uri, MessageTestProtocol)
+    factory = ProtocolFactory(uri, SimpleProtocol)
     factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
 
     ws.connectWS(factory, timeout=1)

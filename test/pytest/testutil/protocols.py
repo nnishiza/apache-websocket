@@ -20,3 +20,24 @@ class ProtocolFactory(ws.WebSocketClientFactory):
 
         self.connected.callback(proto)
         return proto
+
+class SimpleProtocol(ws.WebSocketClientProtocol):
+    """
+    Implements WebSocketClientProtocol for simple connection tests.
+
+    The opened and closed attributes are Deferreds that can be waited on. The
+    closed Deferred will return the received close code in its callback.
+    """
+    def __init__(self):
+        ws.WebSocketClientProtocol.__init__(self)
+
+        self.opened = defer.Deferred()
+        self.closed = defer.Deferred()
+
+    def onOpen(self):
+        self.opened.callback(None)
+
+    def onClose(self, wasClean, code, reason):
+        assert wasClean
+        self.closed.callback(code)
+
