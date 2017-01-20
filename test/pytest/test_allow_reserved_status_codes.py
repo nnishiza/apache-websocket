@@ -4,6 +4,7 @@ import pytest
 from twisted.internet import defer
 
 from testutil.websocket import make_root, SCHEME
+from testutil.protocols import ProtocolFactory
 
 CLOSE_CODE_PROTOCOL_ERROR = 1002
 
@@ -37,26 +38,6 @@ class CloseTestProtocol(ws.WebSocketClientProtocol):
     def sendClose(self, code=None, reason=None):
         self.sendCloseFrame(code=code, isReply=False)
 
-class CloseTestFactory(ws.WebSocketClientFactory):
-    """
-    An implementation of WebSocketClientFactory that allows the its client code
-    to retrieve the first protocol instance that is built using the connected
-    callback.
-    """
-    protocol = CloseTestProtocol
-
-    def __init__(self, uri):
-        ws.WebSocketClientFactory.__init__(self, uri)
-        self.proto = None
-        self.connected = defer.Deferred()
-
-    def buildProtocol(self, addr):
-        proto = CloseTestProtocol()
-        proto.factory = self
-
-        self.connected.callback(proto)
-        return proto
-
 #
 # Helpers
 #
@@ -73,11 +54,11 @@ def failed(code):
 
 def connect(uri):
     """
-    Constructs a CloseTestFactory, connects to the desired WebSocket endpoint
+    Constructs a ProtocolFactory, connects to the desired WebSocket endpoint
     URI, waits for the CloseTestProtocol to be constructed, and then returns the
     protocol instance.
     """
-    factory = CloseTestFactory(uri)
+    factory = ProtocolFactory(uri, CloseTestProtocol)
     factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
 
     ws.connectWS(factory, timeout=1)

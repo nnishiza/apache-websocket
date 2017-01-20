@@ -5,6 +5,7 @@ import struct
 from twisted.internet import defer
 
 from testutil.websocket import make_root, SCHEME
+from testutil.protocols import ProtocolFactory
 
 CLOSE_CODE_NORMAL_CLOSURE  = 1000
 CLOSE_CODE_MESSAGE_TOO_BIG = 1009
@@ -38,37 +39,17 @@ class MessageTestProtocol(ws.WebSocketClientProtocol):
         assert wasClean
         self.closed.callback(code)
 
-class MessageTestFactory(ws.WebSocketClientFactory):
-    """
-    An implementation of WebSocketClientFactory that allows its client code to
-    retrieve the first protocol instance that is built using the connected
-    callback.
-    """
-    protocol = MessageTestProtocol
-
-    def __init__(self, uri):
-        ws.WebSocketClientFactory.__init__(self, uri)
-        self.proto = None
-        self.connected = defer.Deferred()
-
-    def buildProtocol(self, addr):
-        proto = MessageTestProtocol()
-        proto.factory = self
-
-        self.connected.callback(proto)
-        return proto
-
 #
 # Fixtures
 #
 
 def connect(uri):
     """
-    Constructs a MessageTestFactory, connects to the desired WebSocket endpoint
+    Constructs a ProtocolFactory, connects to the desired WebSocket endpoint
     URI, waits for the MessageTestProtocol to be constructed, and then returns
     the protocol instance.
     """
-    factory = MessageTestFactory(uri)
+    factory = ProtocolFactory(uri, MessageTestProtocol)
     factory.setProtocolOptions(failByDrop=False, openHandshakeTimeout=1)
 
     ws.connectWS(factory, timeout=1)
