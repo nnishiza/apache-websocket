@@ -1,6 +1,6 @@
 .PHONY: install clean check start restart stop examples install-examples \
 		test-folders test-modules start-test-server restart-test-server \
-		stop-test-server
+		stop-test-server debug
 
 # Absolute path to the current directory.
 CURDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
@@ -90,7 +90,16 @@ $(TEST_MODULES_ALL_PATHS):
 	mkdir -p $(TEST_MODULEDIR)
 	$(LIBTOOL) --silent --mode=install cp $< $(abspath $@)
 
-start-test-server restart-test-server: test-modules test-folders
-start-test-server restart-test-server stop-test-server:
-	$(HTTPD) -d "$(CURDIR)/test/httpd" -f test.conf \
-	         -k $(patsubst %-test-server,%,$@)
+# DEBUGGER is used only in the `make debug` target. Defaults to "gdb --args";
+# you can override this on the command line.
+debug: DEBUGGER := gdb --args
+start-test-server restart-test-server stop-test-server: override DEBUGGER :=
+
+# For the debug target, pass -X to httpd. For the other test-server targets,
+# pass start/restart/stop as appropriate.
+debug: HTTPD_ARGS := -X
+start-test-server restart-test-server stop-test-server: HTTPD_ARGS = -k $(patsubst %-test-server,%,$@)
+
+debug start-test-server restart-test-server: test-modules test-folders
+debug start-test-server restart-test-server stop-test-server:
+	$(DEBUGGER) $(HTTPD) -d "$(CURDIR)/test/httpd" -f test.conf $(HTTPD_ARGS)
