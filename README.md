@@ -89,10 +89,12 @@ the use of a static MPM.
 
 #### Other Helpful Rules
 
-    $ make clean                         # removes the build artifacts
-    $ [sudo] make install-examples       # installs the example plugins
-    $ [sudo] make [start|stop|restart]   # starts/stops/restarts httpd via apachectl
-    $ make [start|stop]-test-server      # starts/stops the standalone test server
+    $ make clean                             # removes the build artifacts
+    $ [sudo] make install-examples           # installs the example plugins
+    $ [sudo] make [start|stop|restart]       # starts/stops/restarts httpd via apachectl
+    $ make [start|stop|restart]-test-server  # starts/stops/restarts the standalone test server
+    $ make debug [DEBUGGER=program]          # starts the test server under DEBUGGER
+                                             # (`gdb --args` by default)
 
 ### CMake (Windows-only)
 
